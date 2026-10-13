@@ -42,7 +42,7 @@ library(fuzzyjoin)
 
 #Set random seed and working directory.
 set.seed(210226)
-setwd("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/epi-work/mar-res-main/")
+setwd("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/ch265493/mfm-penn/epi-work/mar-res-main/")
 pH_threshold <- 7.10
 base_excess_threshold <- Inf #Functionally no upper limit to the base excess
 #This contains the main analysis; changing these thresholds and working directory results in the sensitivity-analysis definition 
@@ -365,7 +365,7 @@ divide_ph <- function(pH, base_excess) {
 # # #######----------PREPROCESS COVARIATES----------
 
 #Load raw data.
-births <- read.csv("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/combined_covariates-2025-11-03.csv") %>%
+births <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/combined_covariates-2025-11-03.csv") %>%
     rename(baby_mrn=Baby.MRN, maternal_mrn=MRN) #Initially: 83953 unique births, 68110 unique maternal MRNs- roughly 1.23 births per mother
 
 
@@ -574,21 +574,21 @@ births <- births %>% mutate(maternal_mrn=
 #Load offsets from individual files.
 offsets <- data.frame()
 for (k in 1:9) {
-    df <- read.csv(paste0("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/id_map/CTGData_offsets/0", k, "_offsetmap.csv"))
+    df <- read.csv(paste0("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/id_map/CTGData_offsets/0", k, "_offsetmap.csv"))
     offsets <- rbind(offsets, df)
 }
 offsets <- offsets %>%
         rename(filename=file)
 
 #Link trace-end timestamps to maternal MRNs, joining the ID-map to the trace file on filenames.
-id_map <- read.csv("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/id_map/Project Data trace_start_end_ctgdata_MASTER identified dataset 124776 tracings JM merge 12.5.22.csv") %>%
+id_map <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/id_map/Project Data trace_start_end_ctgdata_MASTER identified dataset 124776 tracings JM merge 12.5.22.csv") %>%
     mutate(filename=purrr::map_vec(filename, function(x){str_split(x, "/")[[1]][2]})) %>%
     rename(maternal_mrn=Mother.MRN) %>%
     select(maternal_mrn, filename, trace_end) %>% #Keep the trace_end in order to number births consistently. Assume that each trace_end uniquely identifies a birth.
     left_join(offsets, by="filename")
 
 #Now load lab results and link them to maternal MRNs.
-lab_results <- read.csv("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/CTGData_labs.csv") %>%
+lab_results <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/CTGData_labs.csv") %>%
     inner_join(id_map, by="filename") %>%
     mutate(parsed_trace_end_date=parse_date_time(trace_end, "mdy HM"), parsed_order_date=ymd_hms(LabOrderDtime)) %>% #1.129 filenames per mother; 1.101 valid delivery dates per mother; 1.283 unique order timestamps per mother.
     filter(LabTestName %in% c("pH Cord", "Base Excess Cord")) %>% #1.073 filenames per mother; 1.04 valid delivery dates per mother; 1.106 unique order timestamps per mother.
@@ -729,14 +729,15 @@ outcomes <- c(colnames(births)[endsWith(colnames(births), "acidemia")], "depress
 
 #Define variables we are interested in summarising, and their names.
 variables_to_summarise <- c(
-    "delivery_method", "maternal_age", "pregnancy_term", "race", "categorised_num_pregnancies", "categorised_num_births",
-    "previous_c_section_indicated", "year_of_delivery", "season_of_delivery",
-    "time_of_delivery", "is_weekend",
+    "delivery_method", "maternal_age", "pregnancy_term", "race", "categorised_num_pregnancies", "categorised_num_births", "previous_c_section_indicated",
+    #"year_of_delivery", "season_of_delivery",
+    # "time_of_delivery", "is_weekend",
       outcomes
 )
 variable_names <- c(
     "Delivery Method", "Maternal Age", "Pregnancy Term", "Race", "Previous Pregnancies", "Previous Births", 
-    "Previous C-section?", "Year", "Season", "Time of Day", "Weekend?",
+    "Previous C-section?", 
+    # "Year", "Season", "Time of Day", "Weekend?",
      paste("Outcome:", outcomes)
 )
 
@@ -769,7 +770,7 @@ for (i in 1:length(variables_to_summarise)) {
 total_births <- nrow(births)
 
 summary_table <- summary_table %>% 
-    mutate(NumBirths = paste0(NumBirths, " (", signif(NumBirths/total_births*100, 2), "%)"))
+    mutate(NumBirths = paste0(NumBirths, " (", signif(NumBirths/total_births*100, 3), "%)"))
 
 #Attach size of cohort to the top of the table
 summary_table <- rbind(data.frame(Attribute="Overall", Characteristic="", NumBirths=total_births), summary_table)
@@ -786,7 +787,11 @@ print(quantile(births$raw_maternal_age, c(0.25, 0.75)))
 print(paste("Gestational age:", median(as.numeric(births$gestation_age_in_weeks))))
 print(quantile(as.numeric(births$gestation_age_in_weeks), c(0.25, 0.75)))
 
+
 #Plot Apgar scores.
+graphics.off()  # closes any lingering/orphaned graphics devices
+file.exists("unadjusted_apgar.pdf")
+file.remove("unadjusted_apgar.pdf") 
 p <- ggplot(births, aes(x=apgar_score)) +
     geom_histogram() + labs(
         x="5-Minute Apgar Score",
@@ -804,6 +809,7 @@ theme_minimal(base_size = 18) +
         panel.grid.major.x = element_blank()) +
     scale_fill_brewer(palette="Dark2") 
     ggsave("unadjusted_apgar.pdf", width=8, height=5, plot=p)
+
 
 
 
@@ -884,6 +890,7 @@ p <- ggplot(unadjusted_differences_in_outcome_by_method,
         legend.text = element_text(size=12),
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
+    file.remove("unadjusted_outcome_rates_by_method.pdf")
     ggsave("unadjusted_outcome_rates_by_method.pdf", width=12, height=4, plot=p)
 
 
@@ -904,7 +911,6 @@ for (rc in race_exposures) {
         diffs <- df %>%
             summarise(pval= measure_binary_differences(race, delivery_method==dm)) %>%
             mutate(race=rc, delivery_method=dm) 
-    
         unadjusted_differences_in_method_by_race <- rbind(unadjusted_differences_in_method_by_race, diffs)
     }
 }
@@ -912,7 +918,6 @@ for (rc in race_exposures) {
 unadjusted_differences_in_method_by_race <- unadjusted_differences_in_method_by_race %>%
     mutate(
         signif=asterisk(pval)) 
-
 
 #Now get rates of each outcome by race.
 rates_by_race <- births %>%
@@ -955,7 +960,95 @@ p <- ggplot(unadjusted_differences_in_method_by_race,
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank()) +
     scale_fill_brewer(palette="Dark2") 
+    file.remove("unadjusted_method_by_race.pdf")
     ggsave("unadjusted_method_by_race.pdf", width=10, height=6, plot=p)
+
+
+# ---- Prep ------------------------------------------------------------------
+unadjusted_differences_in_method_by_race <- unadjusted_differences_in_method_by_race %>%
+    filter(race == 'Black' | race == 'White') %>%
+    group_by(delivery_method) %>%
+    mutate(
+        pval = pval[race == 'Black'],  # comparison is always vs. White
+        rounded_pval = case_when(
+            pval < 0.001 ~ "p <.001",
+            pval < 0.01  ~ paste("p =", sub("^0", "", sprintf("%.3f", pval))),
+            TRUE         ~ paste("p =", sub("^0", "", sprintf("%.2f", pval)))
+        ),
+        pct = rate * 100,
+        pct_label = sprintf("%.1f", pct),   # 1 decimal place, not signif(2)
+        max_rate = max(pct)
+    ) %>%
+    ungroup() %>%
+    mutate(
+        delivery_method = factor(
+            delivery_method,
+            levels = c("CD (FHT)", "CD (Labor Arrest)", "CD (Planned)", "Vaginal")
+        )
+    )
+
+# One p-value label per delivery method, placed just above that group's tallest bar
+p_labels <- unadjusted_differences_in_method_by_race %>%
+    distinct(delivery_method, rounded_pval, max_rate) %>%
+    mutate(y = max_rate + 8)
+
+y_top <- max(p_labels$y) + 6  # headroom so labels don't get clipped
+
+# ---- Colors ------------------------------------------------------------------
+# Colorblind-safe, print/grayscale-legible palette (Okabe-Ito).
+race_colors <- c("Black" = "#0072B2", "White" = "#E69F00")
+
+# ---- Plot --------------------------------------------------------------------
+p <- ggplot(unadjusted_differences_in_method_by_race,
+            aes(fill = race, y = pct, x = delivery_method)) +
+    geom_col(
+        position = position_dodge(width = 0.75),
+        width = 0.7,
+        color = "black",
+        linewidth = 0.3
+    ) +
+    geom_text(
+        aes(y = pct + 2.5, label = pct_label),
+        position = position_dodge(width = 0.75),
+        size = 3.8,
+        family = "sans"
+    ) +
+    geom_text(
+        data = p_labels,
+        aes(x = delivery_method, y = y, label = rounded_pval),
+        inherit.aes = FALSE,
+        size = 4,
+        fontface = "italic",
+        family = "sans"
+    ) +
+    scale_y_continuous(
+        limits = c(0, y_top),
+        expand = expansion(mult = c(0, 0)),
+        breaks = seq(0, 80, 20)
+    ) +
+    scale_fill_manual(values = race_colors) +
+    labs(
+        x = "Delivery Method",
+        y = "Rate (% of Births)",
+        fill = "Race"
+    ) +
+    theme_classic(base_size = 13, base_family = "sans") +
+    theme(
+        axis.title = element_text(face = "bold", size = 13),
+        axis.text = element_text(color = "black", size = 11),
+        axis.line = element_line(color = "black", linewidth = 0.4),
+        axis.ticks = element_line(color = "black", linewidth = 0.4),
+        legend.position = "right",
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 11),
+        panel.grid = element_blank(),
+        plot.margin = margin(10, 10, 10, 10)
+    )
+
+# ---- Save ----------------------------------------------------------------
+file.remove("unadjusted_method_by_race_black_vs_white.pdf")
+ggsave("unadjusted_method_by_race_black_vs_white.pdf", width = 7, height = 4.5, plot = p, device = cairo_pdf)
+ggsave("unadjusted_method_by_race_black_vs_white.png", width = 7, height = 4.5, plot = p, dpi = 400)
 
 
 
@@ -1033,6 +1126,7 @@ p <- ggplot(unadjusted_differences_in_outcome_by_race,
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank()) +
     scale_fill_brewer(palette="Dark2") 
+    file.remove("unadjusted_outcome_by_race.pdf")
     ggsave("unadjusted_outcome_by_race.pdf", width=15, height=6, plot=p)
 
 ##PART D: SUBGROUP ANALYSIS: ACIDEMIA OUTCOMES BY RACE, SUBGROUPED BY DELIVERY METHOD
@@ -1106,22 +1200,22 @@ p <- ggplot(unadjusted_differences_in_outcome_by_race_and_method,
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank()) +
     scale_fill_brewer(palette="Dark2") 
+    file.remove("unadjusted_outcome_by_race_and_delivery_method.pdf")
     ggsave("unadjusted_outcome_by_race_and_delivery_method.pdf", width=15, height=6, plot=p)
 
 
 #####-----LOGISTIC REGRESSION MODELS OF DELIVERY METHOD AND OUTCOME-----------------
 
 #Define potential predictors of delivery method or outcome (categorical and binary). [RIGHT NOW, leave out previous pregnancies as a predictor]
-ctg_predictors <- c("race", "year_of_delivery", "season_of_delivery",
-    "time_of_delivery", "maternal_age", "pregnancy_term") 
-bin_predictors <- c("is_weekend", "previous_c_section_indicated", "categorised_num_births")
+ctg_predictors <- c("race",  "maternal_age", "pregnancy_term") #"year_of_delivery", "season_of_delivery", "time_of_delivery") 
+bin_predictors <- c("previous_c_section_indicated", "categorised_num_births") #'is_weekend')
 delivery_method_exposures <- c("Cesarean Delivery (FHT)", "Cesarean Delivery (Labor Arrest)", "Cesarean Delivery (Planned)")
 
 #Load preprocessed births.
 births <- read.csv("preprocessed-births-with-outcomes.csv")
 
 #Binarise categorical predictors with respect to a reference (except for delivery method, where we'll binarise all outcomes.)
-ctg_refs <- c("White", 2017, "spring", "afternoon", "20-29", "full term")
+ctg_refs <- c("White", "20-29", "full term") #2017, "spring", "afternoon")
 vars_to_keep <- c("baby_mrn", bin_predictors, outcomes)
 
 
@@ -1172,17 +1266,18 @@ method_predictors_in_order <- c("maternal_age_19_and_under", "maternal_age_30_35
     "pregnancy_term_early_term", "pregnancy_term_late_term",
     "race_asian", "race_black", 
     "race_other", "race_unknown", 
-    "categorised_num_births", "previous_c_section_indicated",
-    "year_of_delivery_2018", "year_of_delivery_2019", "year_of_delivery_2020",
-    "season_of_delivery_summer", "season_of_delivery_autumn", "season_of_delivery_winter",
-    "is_weekend", "time_of_delivery_small_hours", "time_of_delivery_morning", "time_of_delivery_evening"
+    "categorised_num_births", "previous_c_section_indicated"
+    # "year_of_delivery_2018", "year_of_delivery_2019", "year_of_delivery_2020",
+    # "season_of_delivery_summer", "season_of_delivery_autumn", "season_of_delivery_winter",
+    # "is_weekend", "time_of_delivery_small_hours", "time_of_delivery_morning", "time_of_delivery_evening"
     )
-method_predictors_in_order_names <- c("Maternal Age: <20", "Maternal Age: 30-35", "Maternal Age: 35-39", "Maternal Age: 40+",
-    "Gest. Age: <32w", "Gest. Age: 32-37w", "Gest. Age: 37-39w", "Gest. Age: 41w+",
-    "Race: Asian", "Race: Black", "Race: Other", "Race: Unknown",
-    "Previous Births", "Previous CD",
-    "Y: 2018", "Y: 2019", "Y: 2020", "S: Jun-Aug", "S: Sep-Nov", "S: Dec-Feb",
-    "Weekend", "H: 12a-6a", "H: 6a-12p", "H: 6p-12a") 
+method_predictors_in_order_names <- c("<20", "30-35", "35-39", "40+",
+    "<32w", "32-37w", "37-39w", "41w+",
+    "Asian", "Black", "Other", "Unknown",
+    "Previous Births", "Previous CD"
+    # "Y: 2018", "Y: 2019", "Y: 2020", "Jun-Aug", "Sep-Nov", "Dec-Feb",
+    # "Weekend", "12a-6a", "6a-12p", "6p-12a"
+    ) 
 
 
 #Plot the model.
@@ -1225,6 +1320,7 @@ plot_lr_model <- function(overall_results, predictors, predictor_names,
             panel.grid.minor = element_blank(),
             panel.grid.major.x = element_blank()) +
         scale_color_identity() + guides(color="none")
+        file.remove(paste0(savename, ".pdf"))
         ggsave(paste0(savename, ".pdf"), width=width, height=height, plot=p)
 
 }
@@ -1238,16 +1334,23 @@ write.csv(dm_results, "delivery-method-lr.csv")
 plot_lr_model(dm_results, method_predictors_in_order, method_predictors_in_order_names,
     delivery_methods, delivery_method_names,  "lr-delivery-method", "Risk Factors for Delivery Method", width=12)
 
+# print(dm_results)
+
 #Save this as a neat table for the results.
 dm_results <- dm_results %>% mutate(
     variable = factor(variable, levels=rev(method_predictors_in_order), labels=rev(method_predictors_in_order_names))) %>%
-    mutate(or = paste0(round(estimate, digits=2), " (", round(lower_conf, digits=2), "-", round(upper_conf, digits=2), ")")) %>%
-    select(variable, or, signif, outcome) %>%
-    tidyr::pivot_wider(id_cols=variable, names_from=outcome, values_from=c(or, signif)) %>%
+    mutate(or = paste0(round(estimate, digits=2), " (", round(lower_conf, digits=2), "-", round(upper_conf, digits=2), ")"),
+        rounded_pval = case_when(
+            pval < 0.001 ~ "<.001",
+            pval < 0.01  ~ sub("^0", "", sprintf("%.3f", pval)),
+            TRUE         ~ sub("^0", "", sprintf("%.2f", pval))
+        )) %>%
+    select(variable, or, rounded_pval, outcome) %>%
+    tidyr::pivot_wider(id_cols=variable, names_from=outcome, values_from=c(or, rounded_pval)) %>%
     arrange(desc(variable)) %>%
-    select(variable, or_delivery_method_cesarean_delivery_fht, signif_delivery_method_cesarean_delivery_fht, or_delivery_method_cesarean_delivery_labor_arrest,
-        signif_delivery_method_cesarean_delivery_labor_arrest, or_delivery_method_cesarean_delivery_planned, signif_delivery_method_cesarean_delivery_planned, 
-        or_delivery_method_vaginal, signif_delivery_method_vaginal)
+    select(variable, or_delivery_method_cesarean_delivery_fht, rounded_pval_delivery_method_cesarean_delivery_fht, or_delivery_method_cesarean_delivery_labor_arrest,
+        rounded_pval_delivery_method_cesarean_delivery_labor_arrest, or_delivery_method_cesarean_delivery_planned, rounded_pval_delivery_method_cesarean_delivery_planned, 
+        or_delivery_method_vaginal, rounded_pval_delivery_method_vaginal)
 write.csv(dm_results, "dm-results-for-display.csv")
 
 ###PART B: PREDICTING ACIDEMIA OUTCOME
@@ -1337,6 +1440,7 @@ plot_matched_results <- function(results, outcome_name, title, filename,  with_s
 
 
     #Open PDF
+    file.remove(paste0("forest-plots/", filename, ".pdf"))
     pdf(file = paste0("forest-plots/", filename, ".pdf"), 
             width = width, 
             height = height, 
@@ -1604,6 +1708,7 @@ p <- ggplot(matched_rates, aes(x=categorised_pH, y=rate*100, fill=Race)) +
         legend.text = element_text(size=12),
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
+    file.remove("pH_diffs_overall.pdf")
     ggsave("pH_diffs_overall.pdf", width=6, height=4, plot=p)
 
 
@@ -1699,6 +1804,7 @@ p <- ggplot(stratified_matched_rates, aes(x=categorised_pH, y=rate*100, fill=Rac
         legend.text = element_text(size=12),
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
+    file.remove("pH_diffs_overall_by_dm.pdf")
     ggsave("pH_diffs_overall_by_dm.pdf", width=12, height=6, plot=p)
 
 ##########-----PART C: DIFFERENCES IN DELIVERY METHOD BY ACIDEMIA CATEGORY.--------
@@ -1784,6 +1890,7 @@ p <- ggplot(stratified_matched_rates, aes(x=DeliveryMethod, y=rate*100, fill=Rac
         legend.text = element_text(size=12),
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
+    file.remove("dm_diffs_overall_by_pH.pdf")
     ggsave("dm_diffs_overall_by_pH.pdf", width=12, height=6, plot=p)
 
 
@@ -1791,15 +1898,39 @@ p <- ggplot(stratified_matched_rates, aes(x=DeliveryMethod, y=rate*100, fill=Rac
 #TEST FOR DIFFERENCES IN RUPTURE TO DELIVERY TIME
 #Stage 1 and 2 time basically incomprehensible (i.e. NA for almost all patients.)
 #Link rupture to delivery time
-unprocessed_data <- read.csv("/Volumes/chip-lacava/Groups/mfm/penn-maternal-fetal-monitoring/combined_covariates-2025-11-03.csv") %>%
+unprocessed_data <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/combined_covariates-2025-11-03.csv") %>%
      rename(baby_mrn=Baby.MRN, maternal_mrn=MRN) %>% select(baby_mrn, Rupture.to.Delivery) %>%
      mutate(baby_mrn=as.integer(baby_mrn), rupture_to_delivery=purrr::map_vec(Rupture.to.Delivery, rupture_to_delivery)) %>%
      distinct(baby_mrn, rupture_to_delivery)
 write.csv(unprocessed_data, "rupture_to_delivery_time.csv")
 
+#----CHECK FOR MISSINGNESS RATES-----
+
+#In the original, unpreprocessed cohort:
+print(paste("In the original, unpreprocessed cohort, rupture-to-delivery-time is recorded with a missingness rate of:", mean(is.na(unprocessed_data$rupture_to_delivery))))
+
+#In the full preprocessed cohort with outcomes:
+births_to_check_missingness <- read.csv("preprocessed-births-with-outcomes.csv") %>%
+    inner_join(unprocessed_data, by='baby_mrn')
+print(paste("In the full preprocessed cohort with outcomes, rupture-to-delivery-time is recorded with a missingness rate of:", mean(is.na(births_to_check_missingness$rupture_to_delivery))))
+
+print("Descriptive statistics about birth times:")
+birth_duration_summary <- births_to_check_missingness %>%
+    group_by(delivery_method) %>% summarise(
+        median=round(median(rupture_to_delivery, na.rm=TRUE)/60, digits=1),
+        lq = round(quantile(rupture_to_delivery, 0.25, na.rm=TRUE)/60, digits=1),
+        uq = round(quantile(rupture_to_delivery, 0.75, na.rm=TRUE)/60, digits=1),
+        missigness = mean(is.na(rupture_to_delivery))
+    ) %>% ungroup()
+print(birth_duration_summary)
+
+
+
 #Now link these in the matched cohort
 df <- df %>% inner_join(unprocessed_data, by="baby_mrn") %>%
     mutate(log_t = log(rupture_to_delivery))
+
+
 
 #Look for differences in delivery time by mode of delivery
 diffs_in_time <- data.frame(DeliveryMethod=character(0), estimate=numeric(0), lower_conf=numeric(0), upper_conf=numeric(0), pval=numeric(0))
@@ -1827,12 +1958,21 @@ for (dm in c("Cesarean Delivery (FHT)", "Cesarean Delivery (Labor Arrest)", "Vag
     coefs <- as.data.frame(coef(summary))
     confs <- confint.default(lm)
 
-    estimate <- exp(coefs["race_black", 'Estimate'])
-    lower_conf <- exp(confs["race_black", '2.5 %'])
-    upper_conf <- exp(confs["race_black", '97.5 %'])
+    #report effects as percentage changes
+    estimate <- (exp(coefs["race_black", 'Estimate'])-1)*100
+    lower_conf <- (exp(confs["race_black", '2.5 %'])-1)*100
+    upper_conf <- (exp(confs["race_black", '97.5 %'])-1)*100
     pval <- as.numeric(coefs["race_black", 'Pr(>|t|)'])
     diffs_in_time[index,] <- c(dm, estimate, lower_conf, upper_conf, pval)
     index <- index + 1
+
+    #Print the average rupture-to-delivery time.
+    print(paste("Distribution of matched rupture-to-delivery times for DM:", dm))
+    summary <- matched_subdf %>% group_by(race_black) %>%
+        summarise(median = median(rupture_to_delivery, na.rm = TRUE),
+        lq = quantile(rupture_to_delivery, 0.25), uq = quantile(rupture_to_delivery, 0.75))
+    print(summary)
+
 
 }
 
@@ -1865,4 +2005,5 @@ p <- ggplot(stratified_matched_cohorts, aes(x=log_t, fill=Race)) +
         legend.text = element_text(size=12),
         panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
+    file.remove("time_diffs_overall_by_dm.pdf")
     ggsave("time_diffs_overall_by_dm.pdf", width=12, height=6, plot=p)
