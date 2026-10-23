@@ -330,7 +330,9 @@ births <- births %>%
              fetal_tracing_indicated, other_unplanned, stillbirth_recorded,
              maternal_age,  num_previous_pregnancies, num_parity, apgar_score, depressed_apgar,
              stage_1_length, stage_2_length, arbitrary_timestamp, original_delivery_date, raw_maternal_age, pregnancy_term,
-                previous_c_section_indicated_directly, Induction, Augmentation, L.D.Complications, Rupture.Type, Forceps.Attempted, Vacuum.Attempted) #%>% 
+                previous_c_section_indicated_directly, Induction, Augmentation, L.D.Complications, Rupture.Type, Forceps.Attempted, Vacuum.Attempted, Total.Labor.Length, Delivery.Method, Delivery.Method.1) #%>% 
+
+
 
 #print(paste("After filtering out births not at HUP:", length(unique(births$baby_mrn)), "births")) 
 
@@ -378,7 +380,7 @@ births <- births %>%
                     delivery_method=='Cesarean Delivery (Planned)' ~ 'None',
                     any_induction==1 ~ 'Induced',                               #Excludes planned C-sections
                     any_augmentation==1 ~ 'Spontaeneous (With Augmentation)',   #Excludes induction
-                    any_augmentation==0 ~ 'Spontaeneous (Without Augmentation)',
+                    any_augmentation==0 ~ 'Spontaeneous (Without Augmentation)', #Labor onset not reliably assessed
                     .default = 'Other/Unknown'
                 )
             )

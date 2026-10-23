@@ -1375,7 +1375,7 @@ plot_lr_model(outcome_results, outcome_predictors, outcome_predictor_names,
 
 ####---------------COARSENED EXACT MATCHING FOR ACIDEMIA OUTCOMES------
 
-#Match Black and white patients according to: maternal age, pregnancy term, mode of delivery, previous birth, whether or not they have previous Cesarean Deliverys; if possible, year of delivery and time of day.
+#Match Black and white patients according to: maternal age, pregnancy term, mode of delivery, previous birth, whether or not they have previous Cesarean Deliveries; if possible, year of delivery and time of day.
 #We use nearest-neighbour matching where each treated (Black) patient is matched to a white patient.
 
 #First, identify exposure and reference cohort.
