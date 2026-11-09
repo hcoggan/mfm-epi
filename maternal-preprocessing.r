@@ -1,26 +1,10 @@
-
 library(lubridate)
-library(ggsurvfit)
-library(gtsummary)
+library(jsonlite)
 library(tidycmprsk)
 library(testit)
-library(httpgd)
 library(broom)
 library(stringr)
-library(patchwork)
-library(forcats)
-library(pROC)
-library(ggsignif)
-library(ggraph)
-library(tidygraph)
-library(igraph)
-library(ggdendro)
-library(car)
 library(weights)
-library(survey)
-library(metafor)
-
-library(knitr)
 library(dplyr)
 library(survival)
 library(ggplot2)
@@ -28,498 +12,460 @@ library(tibble)
 library(janitor)
 library(MatchIt)
 library(data.table)
-library(exact2x2)
-library(cobalt)
-library(zipcodeR)
+library(tidyverse)
 library(xgboost)
-library(glmnet)
-library(cowplot)
-library(yardstick)
-library(ggridges)
-library(comorbidity)
-library(readr)
-library(fuzzyjoin)
+library(pROC)
 
 #Set random seed and working directory.
 set.seed(210226)
-setwd("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/ch265493/mfm-penn/epi-work/mar-res-main/")
-pH_threshold <- 7.10
-base_excess_threshold <- Inf #Functionally no upper limit to the base excess
-#This contains the main analysis; changing these thresholds and working directory results in the sensitivity-analysis definition 
+setwd("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/ch265493/mfm-penn/epi-work/preprocessing/")
+load_filepath <- "/Users/helenacoggan/Documents/OSXLAP12460/mfm/new-dataset/"
+
+#Define thresholds.
+arterial_threshold <- 7.10
+cantu_venous_threshold <- 7.15
+
+#-----LOAD DATASETS-----------------------------------
+deliveries  <- fread(paste0(load_filepath, "Deliveries Dataset 2026.11.01.csv"))
+# labs        <- read.csv(paste0(load_filepath, "Labs Dataset 2026.11.01.csv"))
+pregnancies <- fread(paste0(load_filepath, "Pregnancies Dataset 2026.11.01.csv"))
+newborns    <- fread(paste0(load_filepath, "Newborns Dataset 2026.11.01.csv"))
+
+#------DEFINE COLUMNS--------------------
+id_cols <- c("PregnancyId", "NewbornId", "DeliveryMrn")
+
+covariate_cols <- c("maternal_age", "pregnancy_term", "year_of_delivery",
+                "gestation_age_in_weeks",
+                "race", "bmi_at_last_prenatal_visit", "FetalAnomalies",
+                "parity", "prior_cd", "insurance", "prenatal_care_utilisation",
+                "hypertensive_disorders", "diabetes", "substance_use_during_pregnancy", 
+                "DeliveryHospital")
+
+outcome_cols <- c(
+    "delivery_method", "depressed_apgar", "neonatal_demise",
+    "nicu_adm", "dx_hie", 
+    "arrival_to_delivery", #Current labor duration measure
+    "arterial_ph_recorded", "any_ph_recorded",
+    "arterial_acidemia", "univ_acidemia", "cantu_acidemia"
+)
 
 
+#######------FILTER VISITS-----------------------------------
 
-#####------SUPPLEMENTARY FUNCTIONS---------------
+# Check that records are not duplicated between pregnancies.
+assert(nrow(deliveries)==length(unique((deliveries$PregnancyId))))
 
+# Keep singleton births only (using both the direct indication in the record and the indirect indication from pregnancies/cesarean indication.)
+# Don't filter out stillbirths; this is a form of conditioning on the outcome.
+deliveries <- deliveries %>%
+    group_by(PregnancyId) %>% 
+    mutate(DistinctFetuses=n_distinct(NewbornId)) %>%
+    ungroup() %>%
+    filter(NumberOfFetuses==1, DistinctFetuses==1) %>%
+    select(-DistinctFetuses) %>%
+    filter(!grepl("Multiple Gestation", CesareanIndication))
 
-#Process MRNs.
-process_maternal_mrns <- function(mrn) {
-    
-    #Remove 'R0' endings
-    altered_mrn <- str_split(mrn, "-R")[[1]][1] 
+print(paste0("At the start of the process, we have ", nrow(deliveries), " distinct singleton deliveries."))
 
-    if(startsWith(altered_mrn, "0")) {
-        altered_mrn <- str_remove(altered_mrn, "0")
-    }
-    return(altered_mrn)
-}
+# Keep only those after May 2015 (when arterial pH recording starts).
+deliveries <- deliveries %>% 
+    filter((
+        month(BirthInstant) >= 5 & year(BirthInstant)== 2015) | year(BirthInstant) >= 2016
+    )
 
+print(paste0("After filtering out births before May 2015, we have ", nrow(deliveries), " distinct singleton deliveries."))
 
-#Define an asterisk function.
-asterisk <- function(pval) {
-    res <- case_when(
-                pval < 0.001 ~ "***",
-                pval < 0.01 ~ "**",
-                pval < 0.05 ~ "*",
-                .default=""
-            )
-    return(res)
- }
+#Filter out abortions and those with unspecified delivery method.
+deliveries <- deliveries %>% 
+    filter(!is.na(DeliveryMethod), !(DeliveryMethod %in% c("SAB", "TAB")))
 
+print(paste0("After filtering out abortions, we have ", nrow(deliveries), " distinct singleton deliveries."))
 
-#Define a function to pull out gestation age in weeks.
-gest_age <- function(ga) {
-    split <- str_split_1(ga, "w")
-    if (length(split)==2) {
-        return(as.numeric(split[1]) + as.numeric(str_remove(split[2], "d"))/7)
-    } else {return(NA)}
-}
-
-#Define a function to pull out rupture to delivery time in minutes.
-rupture_to_delivery <- function(rup) {
-    split <- str_split_1(rup, "h ")
-    if (length(split)==2) {
-        return(as.numeric(split[1])*60 + as.numeric(str_remove(split[2], "m")))
-    } else {return(NA)}
-}
-
-#Extract the duration of each stage of labour.
-labour_stage <- function(time) {
-    days <- as.numeric(str_extract(time, "\\d+(?= day?)"))
-    hours <- as.numeric(str_extract(time, "\\d+(?= hour?)"))
-    mins <- as.numeric(str_extract(time, "\\d+(?= minute)"))
-    total_duration_in_mins <- sum(24*60*days + 60*hours + mins, na.rm = TRUE)
-    if(total_duration_in_mins==0) {
-        total_duration_in_mins <- NA
-    }
-    return(total_duration_in_mins)
-}
-
-#Extract number of PREVIOUS pregnancies; a woman on her first pregnancy has a gravidity of 1
-previous_pregnancies <- function(gp) {
-    matches <- str_match(gp, "G(\\d+)P(\\d+)")
-    g <- as.numeric(matches[2])
-    return(g-1)
-}
-
-#Extract parity
-parity <- function(gp) {
-    matches <- str_match(gp, "G(\\d+)P(\\d+)")
-    p <- as.numeric(matches[3])
-    return(p)
-}
-
-#Does she have any previous Cesarean Deliverys indicated indirectly?
-identify_previous_c_sections <- function(births, i) {
-    mrn <- births$maternal_mrn[i] #Identify this mother
-    baby_mrn <- births$baby_mrn[i] #Identify the baby
-    mat_age <- births$raw_maternal_age[i] #Identify her age
-    num_preg <- births$num_previous_pregnancies[i] #Identify number of previous pregnancies
-
-    previous <- sum(
-        births$maternal_mrn == mrn & #Previous births to the same mother
-        !(births$baby_mrn == baby_mrn) & #Different baby
-        births$raw_maternal_age <= mat_age & 
-        births$num_previous_pregnancies < num_preg & (
-            (births$delivery_method %in% c("Cesarean Delivery (unplanned, with FTI)", "Cesarean Delivery (planned)", "Cesarean Delivery (unplanned, without FTI)")) | #Either THIS birth was by Cesarean Delivery, or
-            (births$previous_c_section_indicated_directly == 1)) #Cesarean Delivery has already taken place by then
-        )
-    return(ifelse(previous>0, 1, 0))
-}
-
-
-
-#Now evaluate a single model by checking VIFs and computing odds ratios.
-evaluate_model <- function(df, outcomes, predictors) {
-
-    #Check VIFs of the baseline variables (not the interaction terms.)
-    max_vif <- evaluate_vifs(df, outcomes, predictors)
-    assert(max_vif < 5) #If the VIFs are too high, this assertion will break the code.
-
-    #Now
-    overall_results <- evaluate_predictors(df, outcomes, predictors)
-
-    return(overall_results) 
-
-}
-
-# # #######----------PREPROCESS COVARIATES----------
-
-#Load raw data.
-births <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/combined_covariates-2025-11-03.csv") %>%
-    rename(baby_mrn=Baby.MRN, maternal_mrn=MRN) #Initially: 83953 unique births, 68110 unique maternal MRNs- roughly 1.23 births per mother
-
-
-#Define necessary covariates.
-births <- births %>% 
-    distinct(baby_mrn, .keep_all = TRUE) %>% #Get rid of multiple records per baby.- now 68110 unique maternal MRNs (83953 unique births)
-     mutate(
-
-        apgar_score = as.numeric(Apgar.5), #5-minute Apgar score--in final cohort, 65 have none recorded (0.75% of final cohort)
-        depressed_apgar = ifelse(!is.na(apgar_score) & (apgar_score < 7), 1, 0),
-
-         gestation_age_in_weeks=purrr::map_vec(GA, gest_age),
-
-         pregnancy_term=case_when(
+######-----PROCESS COVARIATES--------------
+deliveries <- deliveries %>%
+    mutate(
+        AgeAtDelivery = as.numeric(AgeAtDelivery),
+        maternal_age = case_when(
+            AgeAtDelivery < 20 ~ "19 and under",
+            AgeAtDelivery < 30 ~ "20-29",
+            AgeAtDelivery < 35 ~ "30-35",
+            AgeAtDelivery < 40 ~ "35-39",
+            AgeAtDelivery >= 40 ~ "40+",
+            .default=NA
+        ),
+        gestation_age_in_weeks = floor(as.numeric(GestationalAgeDays)/7), #Gestational age in completed weeks
+        pregnancy_term=case_when(
             gestation_age_in_weeks < 28 ~ "extremely preterm",
             gestation_age_in_weeks < 32 ~ "very preterm",
             gestation_age_in_weeks < 37 ~ "preterm",
             gestation_age_in_weeks < 39 ~ "early term",
             gestation_age_in_weeks < 41 ~ "full term",
             gestation_age_in_weeks >= 41 ~ "late term", #Not enough (post-term (post 41 weeks) to be useful)
-            .default=NA     
+            .default=NA  
         ),
-
-        race=case_when(
-            Race %in% c('Black', 'White', 'Asian', 'American Indian', 'Pacific Island', 'East Indian') ~ Race,
-            Race == 'HLW-Hispanic Latino/White' ~ "White",
-            Race == 'HLB-Hispanic Latino/Black' ~ "Black",
-            Race == "" | is.na(Race) | is.null(Race) | grepl("Patient Declined", Race) | grepl("Unknown", Race) ~ "Unknown",
-            .default = "Other"
-        ),
-
-        #Record the presence of a previous cesarean
-        previous_c_section_indicated_directly=ifelse(
-            Delivery.Method=="VBAC" | Delivery.Method.1 == "VBAC" | (!is.na(as.numeric(Prior.C.S.Ct)) & (as.numeric(Prior.C.S.Ct)>0)) , 1, 0),
-
-        delivery_method = case_when(
-            Delivery.Method %in% c('VBAC, Spontaneous', 
-                'Vaginal, Spontaneous', 
-                'Vaginal, Forceps',
-                'Vaginal, Vacuum (Extractor)', 
-                'Vaginal Delivery', 
-                'Vaginal, Breech', 
-                'SVD*',
-                'FAVD', 
-                'Vaginal Delivery`', 
-                'Vacuum Assisted Delivery',
-                'Forceps Assisted Delivery') |
-            Delivery.Method.1 %in% c('VBAC, Spontaneous', 
-                'Vaginal, Spontaneous', 
-                'Vaginal, Forceps',
-                'Vaginal, Vacuum (Extractor)', 
-                'Vaginal Delivery', 
-                'Vaginal, Breech', 
-                'SVD*',
-                'FAVD', 
-                'Vaginal Delivery`', 
-                'Vacuum Assisted Delivery',
-                'Forceps Assisted Delivery') ~ "Vaginal",
-
-            Delivery.Method %in% c(
-                'C-Section, Classical',
-                'C-Section, Low Transverse',
-                'C-Section, Unspecified',
-                'C-Section, Low Vertical', 
-                'Caesarean Section') |
-            Delivery.Method.1 %in% c(
-                'C-Section, Classical',
-                'C-Section, Low Transverse',
-                'C-Section, Unspecified',
-                'C-Section, Low Vertical', 
-                'Caesarean Section') |
-            !(C.S.Categorization == "") |
-            !(C.S.Priority == "") |
-            !(Indications.for.Cesarean == "") |
-            !(C.Section.Indications== "") |
-            grepl("general", Anesthesia) |
-            grepl("spinal", Anesthesia)
-             ~ "C-Section",
-            .default = "Other/Unknown"
+        year_of_delivery = year(as_datetime(BirthInstant)),
+        ) %>% left_join(
+            select(pregnancies, 
+                c(PregnancyId, DeliveryMrn, OrganizationPrenatalEncounterCount, BmiAtLastPnc, #use BMI at delivery
+                DxPreeclampsia, DxSeverePreeclampsia, DxSuperimposedPreeclampsia, DxEclampsia, DxHELLP, 
+                DxHtnDisorderOfPregnancy, DxGestationalHtn, DxChronicHtnDuringPregnancy, DxGestationalDiabetes, DxPregestationalDiabetes,
+                PregnancyParaCount, PriorCesarean, PatientRace, Ethnicity, InsuranceClass, SmokingTobaccoUse, SmokelessTobaccoUse, AlcoholUse, 
+                CocaineCrackHeroinUse, IllicitDrugUse
+            )), by=c("PregnancyId", "DeliveryMrn")) %>%
+        
+        #Transform race using Carlson priority system.
+        #141 American Indian and 40 Native Hawaiian patients; we group them with Other.
+        mutate(
+            race = case_when(
+                Ethnicity == 'Hispanic Latino' ~ "Hispanic",
+                grepl("Some Other Race|American Indian or Alaskan Native|Native Hawaiian or Other Pacific Islander", PatientRace) ~ "Other",
+                grepl("Asian", PatientRace) ~ "Asian",
+                grepl("Black or African American", PatientRace) ~ "Black",
+                grepl("White", PatientRace) ~ "White",
+                .default = "Unknown"
             ),
 
+            #Categorise BMI according to Carlson.
+            BmiAtLastPnc = as.numeric(BmiAtLastPnc),
+            bmi_at_last_prenatal_visit = case_when( 
+                (BmiAtLastPnc < 15) |  (BmiAtLastPnc > 100) ~ "Unknown",
+                BmiAtLastPnc < 25 ~ "Normal", #As in Carlson, <20 people would be underweight, so we group them with normal weight.
+                BmiAtLastPnc < 30 ~ "Overweight",
+                BmiAtLastPnc < 35 ~ "Obese I",
+                BmiAtLastPnc < 40 ~ "Obese II",
+                BmiAtLastPnc >= 40 ~ "Obese III",
+                .default = "Unknown"
+            ),
 
-        #Temporal variables
-        Delivery.Date.Time=ymd_hms(Delivery.Date.Time),
-        original_delivery_date=Delivery.Date.Time,
-        arbitrary_timestamp=as.numeric(difftime(Delivery.Date.Time, ymd_hms("2000-01-01 00:00:00"), units="mins")), #Define each birth by an arbitrary timestamp 
-        year_of_delivery=year(Delivery.Date.Time),
-        month_of_delivery=month(Delivery.Date.Time),
-        season_of_delivery=case_when(
-            month_of_delivery > 2 & month_of_delivery <= 5 ~ "spring",
-            month_of_delivery > 5 & month_of_delivery <= 8 ~ "summer",
-            month_of_delivery > 8 & month_of_delivery <= 11 ~ "autumn",
-            month_of_delivery > 11 | month_of_delivery <= 2 ~ "winter",
-            .default = NA
-        ),
-        is_weekend=ifelse(wday(Delivery.Date.Time) %in% c(6, 7), 1, 0),
-        hour_of_delivery=hour(Delivery.Date.Time),
-        time_of_delivery = case_when(
-            hour_of_delivery <= 5 ~ "small hours",
-            hour_of_delivery <= 11 ~ "morning",
-            hour_of_delivery <= 17 ~ "afternoon",
-            hour_of_delivery <= 23 ~ "evening",
-            .default = NA
-        ),
+            #Birth history (Prior C-section often null for nulliparous laborers).
+            parity = ifelse(PregnancyParaCount > 0, 1, 0),
+            prior_cd = ifelse(!is.na(parity) & !is.na(PriorCesarean) & PriorCesarean == 1, 1, 0), #
 
-        #Length of stage 1 (before 10cm dilation) and stage 2 (after)
-        stage_1_length = purrr::map_vec(Stage.1.Length, labour_stage),
-        stage_2_length = purrr::map_vec(Stage.2.Length, labour_stage),
+            #Insurance
+            insurance = case_when(
+                InsuranceClass == "Commercial" ~ "private",
+                InsuranceClass %in% c("Medicaid", "Medicare", "Managed Medicaid") ~ "public",
+                .default = "Other/Unknown" #includes TRICARE, VA, self-pay, or unknown
+            ),
 
-        #Location of delivery
-        location=case_when(
-            Delivery.Location %in% c("CHESTER COUNTY HOSPITAL", "HUP", "MEDICAL CENTER OF PRINCETON", "PENNSYLVANIA HOSPITAL") ~ Delivery.Location,
-            .default="Other/Unknown"
-        ),
+            #Prenatal care.
+            #10th percentile of visits is 0, 25th is 5, median is 8, 75th is 11, 90th is 14
+            #Use of the Kotelchuck visits is difficult because we don't know when the prenatal care began
+            #ACOG guidelines recommend visits every 4 weeks, every 2 weeks until 36 weeks, and weekly thereafter
+            #Use Carter 2016 guidelines.
+            prenatal_care_utilisation = case_when(
+                OrganizationPrenatalEncounterCount <= 5 ~ "low",
+                OrganizationPrenatalEncounterCount <= 10 ~ "medium",
+                OrganizationPrenatalEncounterCount > 10 ~ "high",
+                .default = "unknown"
+            ),
+
+            #Pre-existing diagnoses
+            hypertensive_disorders = ifelse(
+                DxPreeclampsia + DxSeverePreeclampsia + DxSuperimposedPreeclampsia + DxEclampsia +
+                DxHELLP + DxHtnDisorderOfPregnancy + DxGestationalHtn + DxChronicHtnDuringPregnancy > 0,
+                1, 0
+            ),
+            diabetes = ifelse(
+                DxGestationalDiabetes + DxPregestationalDiabetes > 0, 1, 0
+            ),
+
+            #Confirmed substance use during pregnancy
+            substance_use_during_pregnancy = ifelse(
+                SmokingTobaccoUse %in% c("Every Day", "Heavy Smoker", "Light Smoker", "Some Days") | #Around 600
+                #excludes 'Smoker, Current Status Unknown', 'Unknown', 'Former', 'Never', 'Never Assessed', 'Passive Smoke Exposure - Never Smoker', null 
+                SmokelessTobaccoUse %in% c('Current') | #Around 39
+                #excludes 'Former', 'Never', 'Unknown', null
+                AlcoholUse %in% c('Yes') | #2300
+                #excludes 'Never', 'No', "Not Asked", 'Not Currently', and null
+                CocaineCrackHeroinUse %in% c('Yes') | # 45
+                #excludes null
+                IllicitDrugUse %in% c('Yes'), #785
+                #excludes 'Never', 'No', "Not Asked", "Not Currently", and "No"
+                1, 0
+            )) 
+
+###---------FILTER FOR KNOWN COVARIATES---------
+deliveries <- deliveries %>%
+    filter(!is.na(maternal_age), !is.na(pregnancy_term), !is.na(DeliveryMethod))
+
+print(paste0("After filtering out those with unknown maternal age, gestational age or delivery method, we have ", nrow(deliveries), " distinct singleton deliveries."))
 
 
-        #If someone does get a C-section, note the presence of specific explanations:
-        fetal_tracing_indicated=ifelse(grepl("Fetal Tracing Indication|Cord Prolapse|Prolapsed Cord|Suspected Uterine Rupture", Indications.for.Cesarean) | grepl("Fetal Tracing Indication|Cord Prolapse|Prolapsed Cord|Suspected Uterine Rupture", C.Section.Indications), 1, 0),
-        other_unplanned=ifelse(grepl("Failed Induction|Arrest of Descent|Arrest of Dilatation", Indications.for.Cesarean) | grepl("Failed Induction|Arrest of Descent|Arrest of Dilatation", C.Section.Indications), 1, 0),
+#######------ATTACH OUTCOMES-----------------------------------
 
-        #Note stillbirths
-        stillbirth_recorded = ifelse(
-            Neonatal.Demise.=="Yes" |
-            Liv.Stat %in% c("ND", "FD"), 1, 0), #'living at delivery' seems to indicate something different.
+# NOTE: the 'labs' dataset does not include pH that I can see-- it's mostly hemoglobin.
 
-        #Now categorise maternal age.
-        maternal_age=case_when(
-            as.numeric(Age..Years.) < 20 ~ "19 and under",
-            as.numeric(Age..Years.) < 30 ~ "20-29",
-            as.numeric(Age..Years.) < 35 ~ "30-35",
-            as.numeric(Age..Years.) < 40 ~ "35-39",
-            as.numeric(Age..Years.) >= 40 ~ "40+",
-            .default=NA
-        ),
+#First, load outcomes.
+outcomes <- newborns %>% rename(DeliveryMrn=MomDeliveryMrn) 
+delivery_times <- deliveries %>% select(BirthInstant, PregnancyId, DeliveryMrn, NewbornId)
 
-        #Keep raw maternal age for later.
-        raw_maternal_age=as.numeric(Age..Years.),
-        
-        #Extract number of previous pregnancies, and previous parity
-        num_previous_pregnancies=purrr::map_vec(GP, previous_pregnancies), 
-        num_parity=purrr::map_vec(GP, parity)
 
-        ) %>% #Still 68110 mothers.
+#Extract JSON measurements.
+get_json_measurements <- function(outcomes, delivery_times, measurement='CordpH') {
 
-        #A check against multiple births: discard births where there's another in the last 30 days.
-        arrange(maternal_mrn, arbitrary_timestamp) %>% group_by(maternal_mrn) %>%
+    #Extract from JSON format.
+    cord_gas <- outcomes %>% select(DeliveryMrn, PregnancyId, NewbornId, !!sym(measurement)) %>% 
+        mutate(!!sym(measurement) := map(!!sym(measurement), ~ {
+            if (is.na(.x)) NULL 
+            else fromJSON(gsub('""', '"', .x))
+        })) %>%
+        unnest(!!sym(measurement)) %>% 
+        mutate(!!sym(measurement) := as.numeric(!!sym(measurement))) %>%
+        filter(!is.na(!!sym(measurement)))
+
+    return(cord_gas)
+}
+
+# Get first cord gas and base excess measurements, stored in JSON format.
+get_first_gas_measurements <- function(outcomes, delivery_times, measurement='CordpH') {
+
+    #Apply JSON extraction function.
+    cord_gas <- get_json_measurements(outcomes, delivery_times, measurement=measurement)
+
+    #Get first measurements.
+    cord_gas <- cord_gas %>% 
+        inner_join(delivery_times, by=c("PregnancyId", "NewbornId", "DeliveryMrn")) %>%
         mutate(
-            num_births_within_1_month = purrr::map_dbl(row_number(), function(i) {
+            CollectionInstant=as_datetime(CollectionInstant),
+            BirthInstant=as_datetime(BirthInstant),
+            cord_gas_interval = as.numeric(CollectionInstant-BirthInstant, units='mins')) %>%
+        #Keep only measurements within the 30-min timeframe.
+        filter(cord_gas_interval <= 30 & cord_gas_interval >= 0) %>% 
+        #Drop non-arterial measurements where arterial ones are available.
+        group_by(PregnancyId, DeliveryMrn, NewbornId) %>%
+        mutate(
+            arterial_available = any(Source=='Arterial')) %>%
+        ungroup() %>%
+        filter(
+            (arterial_available & (Source == 'Arterial')) | (!arterial_available)
+        ) %>%
+        #Take the first of the remaining measurements.
+        group_by(PregnancyId, DeliveryMrn, NewbornId) %>%
+        filter(cord_gas_interval == min(cord_gas_interval)) %>% 
+        ungroup() %>%
+        #If multiple measurements at the same time are available, prefer the venous one; if not, break ties at random.
+        mutate(is_venous = (Source == 'Venous')) %>%
+        group_by(PregnancyId, DeliveryMrn, NewbornId) %>%
+        arrange(PregnancyId, DeliveryMrn, NewbornId, desc(as.integer(is_venous))) %>%
+        dplyr::slice(1) %>%
+        ungroup() %>%
+        select(DeliveryMrn, PregnancyId, NewbornId, Source, !!sym(measurement)) %>%
+        rename(!!sym(paste0(measurement, "_Source")) := Source) 
 
-                current_time <- arbitrary_timestamp[i]
-                current_baby <- baby_mrn[i]
-
-                sum(!(baby_mrn==current_baby) &
-                     (abs(arbitrary_timestamp-current_time) < 24*60*30)) #Count any birth of a DIFFERENT baby within 30 days to the same mother.
-             })) %>% ungroup() %>% filter((year_of_delivery == 2017 & month_of_delivery >=4) | year_of_delivery > 2017, location=="HUP") 
-
-#Identify term births.
-births <- births %>%
-    filter(gestation_age_in_weeks > 20)
-
-print(paste("Initially:", length(unique(births$baby_mrn)), "births at HUP after April 2017 with a GA of more than 20 weeks")) 
-
-births <- births %>%
-    filter(num_births_within_1_month==0) #%>% #Now 66813 records- around 2% of maternal MRNs lost, around 3% of births are multiple, fine- still 1.20 births per mother
-
-print(paste("After filtering out births to the same mother < 1 month apart:", length(unique(births$baby_mrn)), "births")) 
-
-births <- births %>%
-        select(baby_mrn, maternal_mrn, gestation_age_in_weeks, race, delivery_method, year_of_delivery,
-            season_of_delivery, month_of_delivery, is_weekend, hour_of_delivery, time_of_delivery, location, 
-             fetal_tracing_indicated, other_unplanned, stillbirth_recorded,
-             maternal_age,  num_previous_pregnancies, num_parity, apgar_score, depressed_apgar,
-             stage_1_length, stage_2_length, arbitrary_timestamp, original_delivery_date, raw_maternal_age, pregnancy_term,
-                previous_c_section_indicated_directly, Induction, Augmentation, L.D.Complications, Rupture.Type, Forceps.Attempted, Vacuum.Attempted, Total.Labor.Length, Delivery.Method, Delivery.Method.1) #%>% 
-
-
-
-#print(paste("After filtering out births not at HUP:", length(unique(births$baby_mrn)), "births")) 
-
-
-
-#----EXTRACT INDUCTIONS/AUGMENTATIONS/COMPLICATIONS------
-
-#A function to extract multi-valued attributes-- labor complications, induction, and so on.
-extract_vars <- function(birth, col, col_name) {
-
-    #Written for the example of induction.
-
-    #Each induction becomes a vector of 1s and 0s (i.e. induction_Oxytocin...)
-    inductions <- unique(unlist(str_split(births[[col]], '\n')))
-    print(inductions)
-    induction_cols <- c()
-    for (induction in inductions) {
-        if (!((induction=='None') | (induction=='') | (induction=='None.'))) { #i.e. filter out blank strings
-            births[[paste0(col_name, '_', induction)]] <- ifelse(grepl(induction, births[[col]]), 1, 0)
-            induction_cols <- c(induction_cols, paste0(col_name, '_', induction))
-        }
-    }
-    #Also add an any-induction column.
-    births[[paste0('any_', col_name)]] <- ifelse(rowSums(births[induction_cols]) > 0, 1, 0)
-    return(births)
+    return(cord_gas)
 }
 
-#Extract everything we need.
-births <- extract_vars(births, 'Induction', 'induction')
-births <- extract_vars(births, 'Augmentation', 'augmentation')
-births <- extract_vars(births, 'L.D.Complications', 'complication')
+#---Extract cord gas and base excess measurements.
+cord_gas <- get_first_gas_measurements(outcomes, delivery_times)
+base_excess <- get_first_gas_measurements(outcomes, delivery_times, measurement='CordBaseExcess')
 
 
+#---Extract other outcomes from the newborn dataset.
+newborn_outcomes <- outcomes %>%
+    rename(nicu_los = NicuLengthOfStay) %>%
+    mutate(
+        nicu_adm = ifelse(HadNicuAdmission + HadNicuReadmission > 0, 1, 0),
+        dx_hie = !is.na(DxHie)) %>%
+    select(PregnancyId, DeliveryMrn, NewbornId, nicu_los, nicu_adm, dx_hie, ExpiredInNicu)
 
-#----CATEGORISE DELIVERY METHOD/LABOR ONSET-------
+#----Extract outcomes from the pregnancy dataset.
+pregnancy_outcomes <- pregnancies %>% 
+    mutate(
+        fetal_or_neonatal_demise = ifelse(HadFetalDemise + HadNeonatalDemise > 0, 1, 0)
+        ) %>%
+    select(PregnancyId, DeliveryMrn, fetal_or_neonatal_demise, PlannedDeliveryMethod)
 
-births <- births %>%
-             mutate(delivery_method=case_when(
-                delivery_method=="C-Section" & fetal_tracing_indicated ~ "Cesarean Delivery (FHT)",
-                delivery_method=="C-Section" & other_unplanned ~ "Cesarean Delivery (Labor Arrest)",
-                delivery_method=="C-Section" ~ "Cesarean Delivery (Planned)",
-                delivery_method=="Vaginal" ~ "Vaginal",
-                .default = "Other/Unknown") #Classify delivery methods.
-                , labor_onset = case_when(
-                    delivery_method=='Cesarean Delivery (Planned)' ~ 'None',
-                    any_induction==1 ~ 'Induced',                               #Excludes planned C-sections
-                    any_augmentation==1 ~ 'Spontaeneous (With Augmentation)',   #Excludes induction
-                    any_augmentation==0 ~ 'Spontaeneous (Without Augmentation)', #Labor onset not reliably assessed
-                    .default = 'Other/Unknown'
-                )
-            )
+# #---Join these outcomes to the delivery dataset.
+deliveries <- deliveries %>% left_join(
+    newborn_outcomes, by=c("PregnancyId", "DeliveryMrn", "NewbornId")
+) %>% left_join(
+    pregnancy_outcomes, by=c("PregnancyId", "DeliveryMrn") 
+) %>% left_join(
+    cord_gas, by=c("PregnancyId", "DeliveryMrn", "NewbornId")
+) %>% left_join(
+    base_excess, by=c("PregnancyId", "DeliveryMrn", "NewbornId")
+)
+
+assert(nrow(deliveries)==length(unique(deliveries$NewbornId)))
+
+#----ASSESS AVAILABILITY OF CORD GAS DATA------
+
+hosp_cord_gas_dist <- deliveries %>%
+    group_by(DeliveryHospital) %>%
+    mutate(NumBirths = n()) %>%
+    group_by(DeliveryHospital, CordpH_Source) %>%
+    summarise(RecordingRate=round(n()/first(NumBirths)*100, 1), RecordingN=n()) %>%
+    filter(!is.na(CordpH_Source))
+write.csv(hosp_cord_gas_dist, "pH_recording_rates_by_hospital.csv")
+
+hosp_base_excess_dist <- deliveries %>%
+    group_by(DeliveryHospital) %>%
+    mutate(NumBirths = n()) %>%
+    group_by(DeliveryHospital, CordBaseExcess_Source) %>%
+    summarise(RecordingRate=round(n()/first(NumBirths)*100, 1), RecordingN=n()) %>%
+    filter(!is.na(CordBaseExcess_Source))
+write.csv(hosp_base_excess_dist, "base_excess_recording_rates_by_hospital.csv")
+
+#------FILTER FOR HOSPITALS-------
+deliveries <- deliveries %>%
+    filter(DeliveryHospital %in% c("HUP", "PAH"))
+
+print(paste0("After filtering out those outside HUP/PAH, we have ", nrow(deliveries), " distinct singleton deliveries."))
 
 
-#Save raw covariates.
-write.csv(births, "preprocessed-births-without-outcomes.csv")
+#---Extract delivery method (from DeliveryMethod; if unspecified, use CesareanDelivery column to confirm C-sections).
+# #Births are assumed to be C-sections under any of the following conditions:
+    # #C-section actively documented in DeliveryMethod;
+    # #CesareanDeliveryCesareanDelivery column set to 1 (indicating positive documentation of a cesarean);
+    # #C-section indications documented;
+    # #General or spinal anesthesia given.
+    # All other births are assumed to be vaginal (i.e. CDCD ==0 is assumed to indicate vaginal birth.)
+deliveries <- deliveries %>%
+    mutate(
+        delivery_type = case_when(
+            DeliveryMethod %in% c(
+                "C-Section, Classical",
+                "C-Section, Low Transverse",
+                "C-Section, Low Vertical",
+                "C-Section, Unspecified",
+                "Caesarean Section") | 
+                CesareanDeliveryCesareanDelivery == 1 |
+                (!is.na(CesareanIndication) & CesareanIndication != 'null' & CesareanIndication != '') |
+                grepl('Spinal', BirthAnesthesia, ignore.case = TRUE) |
+                grepl('General', BirthAnesthesia, ignore.case = TRUE)
+                ~ "C-Section",
+            DeliveryMethod %in% c(
+                "FAVD",
+                "Forceps Assisted Delivery",
+                "SVD*",
+                "Vacuum Assisted Delivery",
+                "Vaginal Delivery",
+                "Vaginal Delivery`",
+                "Vaginal, Breech",
+                "Vaginal, Forceps",
+                "Vaginal, Spontaneous",
+                "Vaginal, Vacuum (Extractor)",
+                "VBAC, Spontaneous") |
+                CesareanDeliveryCesareanDelivery == 0
+                ~ "Vaginal",
+            .default = 'Unknown'
+            ),
+        #Use the 2025 rules: fetal tracing carries, then labor indication; all other C-sections assumed to be planned.
+        delivery_method = case_when(
+            delivery_type=='C-Section' & grepl("Fetal Tracing Indication|Cord Prolapse|Prolapsed Cord|Suspected Uterine Rupture", CesareanIndication) ~ 'CD (NRFHT)',
+            delivery_type=='C-Section' & grepl("Failed Induction|Arrest of Descent|Arrest of Dilatation", CesareanIndication) ~ "CD (Labor Arrest)",
+            delivery_type=='C-Section' ~ 'CD (Planned)',
+            delivery_type=='Vaginal' ~ 'Vaginal',
+            .default = 'Unknown'
+        )
+        ) 
 
-# #########-----------LINK ACIDEMIA OUTCOMES----------------------
 
-#Load preprocessed visits.
-births <- read.csv("preprocessed-births-without-outcomes.csv") 
+#---MEASURE DELIVERY METHOD INCONSISTENCIES------
+
+# #Check-- cross-compare indications and indications.
+write.csv(table(deliveries$CesareanIndication, deliveries$delivery_method), 'checks/crosstable-methods-and-indication.csv')
+write.csv(table(deliveries$LaborAttempted, deliveries$delivery_method), 'checks/crosstable-methods-and-labor-attempt.csv')
+write.csv(table(deliveries$CesareanExpected, deliveries$delivery_method), 'checks/crosstable-methods-and-cd-expected.csv')
+
+# #Measure inconsistencies between delivery methods and other checks, using the previous set of rules.
+overlaps <- deliveries %>% 
+    group_by(delivery_method) %>%
+    summarise(
+        nrfht_indicated = round(mean(grepl("Fetal Tracing Indication|Cord Prolapse|Prolapsed Cord|Suspected Uterine Rupture", CesareanIndication))*100),
+        labor_arrest_indicated = round(mean(grepl("Failed Induction|Arrest of Descent|Arrest of Dilatation", CesareanIndication))*100),
+        repeat_elective_indicated = round(mean(grepl("Repeat Elective", CesareanIndication))*100),
+        labor_attempt_documented = round(mean(!is.na(LaborAttempted) & LaborAttempted==1)*100),
+        absence_of_labor_attempt_documented = round(mean(!is.na(LaborAttempted) & LaborAttempted==0)*100),
+        expected_c_section_documented = round(mean(!is.na(CesareanExpected) & CesareanExpected==1)*100)
+    )
+write.csv(overlaps, 'checks/methods-crosschecks.csv')
+
+#---Define final outcomes from the delivery method.
+
+deliveries <- deliveries %>% 
+    mutate(
+        depressed_apgar = ifelse(TotalApgarFiveMinute < 7, 1, 0),
+        neonatal_demise = ifelse(
+            fetal_or_neonatal_demise == 1 |
+            BornAlive == 0 | LivingStatus %in% c("Fetal Demise", "Neonatal Demise") |
+            ExpiredInNicu == 1, 
+            1, 0
+        ),
+
+        BirthInstant = as_datetime(BirthInstant),
+        PushingStartInstant = as_datetime(PushingStartInstant),
+        MotherArrivalInstant = as_datetime(MotherArrivalInstant),
+        LaborStartInstant = as_datetime(LaborStartInstant),
+
+        #Labor duration measures.
+        second_stage_duration = as.numeric(SecondStageLengthMinutes),
+        first_stage_duration = as.numeric(FirstStageLengthMinutes),
+        first_and_second_stages_duration = first_stage_duration + second_stage_duration,
+        implied_labor_duration = as.numeric(BirthInstant - LaborStartInstant, units='mins'),
+        pushing_to_delivery = as.numeric(BirthInstant - PushingStartInstant, units='mins'),
+        arrival_to_delivery = as.numeric(BirthInstant - MotherArrivalInstant, units='mins'),
+    )
 
 
-#Refine maternal MRNs. (We have 14270 unique maternal MRNs beforehand, and afterwards; we're not filing anything down.)
-births <- births %>% mutate(maternal_mrn=
-    purrr::map_vec(as.character(maternal_mrn), ~tryCatch(process_maternal_mrns(.x), error=function(e) {NA})))
+#-----ASSESS CORD GAS DISTRIBUTIONS-----
+cord_gas_dist <- ggplot(
+    deliveries, aes(x=CordpH, fill=CordpH_Source)
+) + geom_density(alpha = 0.3) + 
+    labs(x='Cord gas pH', y='Probability density', fill='Source')
+    theme_minimal() +
+    theme(legend.position = "bottom")
+ggsave('cord-gas-dist.pdf', width=6, height=4, cord_gas_dist, dpi=300)
 
-#Load offsets from individual files.
-offsets <- data.frame()
-for (k in 1:9) {
-    df <- read.csv(paste0("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/id_map/CTGData_offsets/0", k, "_offsetmap.csv"))
-    offsets <- rbind(offsets, df)
+any_ph_recorded <- mean(!is.na(deliveries$CordpH_Source))
+arterial_ph_recorded <- mean(!is.na(deliveries$CordpH_Source) & (deliveries$CordpH_Source=='Arterial'))
+
+print(paste0("Of these, we have ", round(any_ph_recorded*100, 1), "% recording rate in pH; for arterial, this is ", round(arterial_ph_recorded*100, 1), "%."))
+
+
+#---DEFINE CORD GAS OUTCOMES-------
+deliveries <- deliveries %>%
+    mutate(
+
+        #Note whether any reading exists.
+        arterial_ph_recorded = ifelse(!is.na(CordpH_Source) & CordpH_Source == 'Acidemia', 1, 0),
+        any_ph_recorded = ifelse(!is.na(CordpH_Source), 1, 0),
+
+        #ACIDEMIA.From most to least conservative:
+
+        #Just use arterial cord gas pH readings.
+        arterial_acidemia = ifelse(
+            arterial_ph_recorded, ifelse(CordpH <= arterial_threshold, 1, 0), NA_real_
+        ),
+
+        #Apply arterial thresholds to all-source pH readings.
+        univ_acidemia = ifelse(
+            any_ph_recorded, 
+            ifelse(CordpH <= arterial_threshold, 1, 0), NA_real_
+        ),
+        
+        #Apply Cantu thresholds to venous and unspecified cord pH readings.
+        cantu_acidemia = ifelse(
+            arterial_ph_recorded, arterial_acidemia, 
+            ifelse(
+                any_ph_recorded, 
+                ifelse(CordpH <= cantu_venous_threshold, 1, 0), NA_real_)
+        )
+
+
+    )
+
+#----FILTER FOR COVARIATES WE CARE ABOUT AND SAVE-------
+deliveries <- deliveries %>% 
+    select(all_of(c(id_cols, covariate_cols, outcome_cols)))
+for (col in colnames(deliveries)) {
+    print(col)
+    assert(sum(is.na(deliveries$col))==0)
 }
-offsets <- offsets %>%
-        rename(filename=file)
-
-#Link trace-end timestamps to maternal MRNs, joining the ID-map to the trace file on filenames.
-id_map <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/id_map/Project Data trace_start_end_ctgdata_MASTER identified dataset 124776 tracings JM merge 12.5.22.csv") %>%
-    mutate(filename=purrr::map_vec(filename, function(x){str_split(x, "/")[[1]][2]})) %>%
-    rename(maternal_mrn=Mother.MRN) %>%
-    select(maternal_mrn, filename, trace_end) %>% #Keep the trace_end in order to number births consistently. Assume that each trace_end uniquely identifies a birth.
-    left_join(offsets, by="filename")
-
-#Now load lab results and link them to maternal MRNs.
-lab_results <- read.csv("/Users/helenacoggan/mnt/chip-lacava-e2/Groups/mfm/penn-maternal-fetal-monitoring/CTGData_labs.csv") %>%
-    inner_join(id_map, by="filename") %>%
-    mutate(parsed_trace_end_date=parse_date_time(trace_end, "mdy HM"), parsed_order_date=ymd_hms(LabOrderDtime)) %>% #1.129 filenames per mother; 1.101 valid delivery dates per mother; 1.283 unique order timestamps per mother.
-    filter(LabTestName %in% c("pH Cord", "Base Excess Cord")) %>% #1.073 filenames per mother; 1.04 valid delivery dates per mother; 1.106 unique order timestamps per mother.
-
-    #If there are multiple labs of the same type ordered at the same timestamp, discard them as a proxy for multiple births.
-    group_by(maternal_mrn, parsed_order_date, LabTestName) %>% #1.073967 filenames/1.043493 delivery dates/1.106282 order timestamps
-    filter(n()==1) %>% 
-    ungroup() %>% 
-    
-    #If there are multiple labs of the same type ordered at DIFFERENT timestamps, take the first one.
-    group_by(maternal_mrn, parsed_trace_end_date, LabTestName) %>%
-    filter(parsed_order_date==first(parsed_order_date)) %>% 
-    ungroup() %>% #1.072218 filenames, 1.043493 order dates, 1.068346 order timestamps
-
-    tidyr::pivot_wider(id_cols=c(maternal_mrn, parsed_trace_end_date, parsed_order_date, filename, offset_hours), names_from=LabTestName, values_from=LabResultValueFloat) %>%
-    clean_names() 
-
-
-#Now link results to births.
-births <- inner_join(births, lab_results, by="maternal_mrn", relationship="many-to-many") %>% #1.08944357774311 births per mother; 1.07106950944704 delivery dates per mother; 1.07115617958052 order dates per mother."
-    ungroup() %>% arrange(maternal_mrn) %>%
-    mutate(parsed_original_delivery_date=ymd_hms(original_delivery_date), offset_hours=ifelse(is.na(offset_hours), 0, offset_hours)) %>%
-    mutate(parsed_trace_end_date_offset = parsed_trace_end_date + hours(offset_hours),
-        parsed_original_delivery_date_offset = parsed_original_delivery_date + hours(offset_hours),
-        parsed_order_date_offset = parsed_order_date + hours(offset_hours)) %>%
-   mutate(mins_from_end_of_tracing_to_delivery=abs(as.numeric(difftime(parsed_original_delivery_date, parsed_trace_end_date, units="mins")))) 
-   
-print(paste("After filtering out births without unique cord pH and cord base excess lab orders (where unique means one timestamp per lab type):", length(unique(births$baby_mrn)), "births")) 
-
-births <- births %>%
-   filter(mins_from_end_of_tracing_to_delivery <= 24*60*30) #%>% #Match within 1 month-- as the tracing often ends a few minutes or hours before the birth. #1.016 births per mother.
-
-
-births <- births %>%
-   group_by(baby_mrn) %>% filter(mins_from_end_of_tracing_to_delivery==min(mins_from_end_of_tracing_to_delivery)) %>% #Take the closest pair of tracing-end/delivery-date if there are multiple in a month
-   ungroup() %>%
-   distinct(maternal_mrn, baby_mrn, .keep_all = TRUE)
-
-print(paste("After filtering out births with lab results more than 1 month from delivery:", length(unique(births$baby_mrn)), "births")) 
+write.csv(deliveries, "preprocessed-deliveries-with-outcomes.csv")
 
 
 
 
-#Keep the first birth associated with every patient.
-births <- births %>% mutate(recorded=1)
-raw_births <- read.csv("preprocessed-births-without-outcomes.csv") %>%
-    left_join(select(births, c(baby_mrn, recorded)), by="baby_mrn") %>%
-    arrange(arbitrary_timestamp) %>%
-    group_by(maternal_mrn) %>% mutate(birth_number=row_number()) %>%
-    filter(recorded==1) %>% ungroup()
 
-births <- births %>%
-    inner_join(select(raw_births, baby_mrn, birth_number), by="baby_mrn") %>%
-    filter(birth_number==1)
-
-print(paste("After taking the first birth to each mother:", length(unique(births$baby_mrn)), "births")) 
-
-
-#Identify whether patients have records of previous C-sections.
-births$previous_c_section_indicated_indirectly <- purrr::map_vec(1:nrow(births), ~identify_previous_c_sections(births, .x), .progress=TRUE)
-births$previous_c_section_indicated <- ifelse(births$previous_c_section_indicated_directly + births$previous_c_section_indicated_indirectly > 0, 1, 0)
-
-#Categorise acidemia outcomes.
-births <- births %>%
-    mutate(p_h_cord = as.numeric(p_h_cord), base_excess_cord = as.numeric(base_excess_cord),
-        acidemia = ifelse((p_h_cord <= pH_threshold) & (base_excess_cord < base_excess_threshold), 1, 0),
-        acidemia_none = ifelse((p_h_cord <= pH_threshold) & (base_excess_cord < base_excess_threshold), 0, 1)) %>% #Main acidemia def is just pH, with base excess as sens. analysis
-    mutate(gestation_age_in_weeks=as.numeric(gestation_age_in_weeks)) %>%
-    filter(!is.na(gestation_age_in_weeks)) #%>% #Discards 30 births.
-
-
-print(paste("After filtering out births with no recorded gestational age:", length(unique(births$baby_mrn)), "births")) 
-
-
-births <- births %>%
-    filter(!is.na(p_h_cord)) %>% #Discards 16 births
-    filter(!is.na(base_excess_cord)) #%>% #Discards 3 births 
-
-print(paste("After filtering out births with either a non-existent pH or base excess results:", length(unique(births$baby_mrn)), "births")) 
-
-
-births <- births %>%
-    mutate(race=case_when(
-        race %in% c("Asian", "East Indian") ~ "Asian", #Groups together 75 East Indian births
-        race %in% c("American Indian", "Pacific Island") ~ "Other", #Groups together 18 births
-        .default = race
-    ), pregnancy_term = case_when(
-        pregnancy_term=="extremely preterm" ~ "very preterm", #only 70 births in this category
-        .default=pregnancy_term 
-    )) %>%
-    filter(!(delivery_method=="Other/Unknown")) #Removes 1 birth.
-
-print(paste("After filtering out births with unknown delivery method:", length(unique(births$baby_mrn)), "births")) 
-
-births <- births %>%
-    mutate(categorised_num_pregnancies = ifelse(is.na(num_previous_pregnancies), NA, ifelse(as.numeric(num_previous_pregnancies) > 1, "2+", as.character(num_previous_pregnancies))),
-            categorised_num_births = ifelse(is.na(num_parity), NA, ifelse(as.numeric(num_parity) > 0, 1, 0))) %>% #Categorises continuous variables.
-        filter(!is.na(categorised_num_births)) %>%
-    clean_names() 
-
-print(paste("After filtering out births with unknown parity:", length(unique(births$baby_mrn)), "births")) 
-
-print(paste("After attaching lab results, we have ", nrow(births), "records.")) #8703 records
-
-#Save preprocessed births with outcomes.
-write.csv(births, "preprocessed-births-with-outcomes.csv")
